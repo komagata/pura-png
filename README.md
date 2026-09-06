@@ -1,6 +1,6 @@
 # pura-png
 
-A pure Ruby PNG decoder/encoder with zero C extension dependencies.
+A pure Ruby PNG decoder/encoder without additional image-processing libraries.
 
 Part of the **pura-*** series — pure Ruby image codec gems.
 
@@ -11,7 +11,7 @@ Part of the **pura-*** series — pure Ruby image codec gems.
 - All 5 filter types: None, Sub, Up, Average, Paeth
 - Zlib compression/decompression via Ruby stdlib
 - Image resizing (bilinear / nearest-neighbor / fit / fill)
-- No native extensions, no FFI, no external dependencies
+- Uses Ruby standard-library `zlib` for compression; no additional image library needed
 - CLI tool included
 
 ## Installation
@@ -57,6 +57,8 @@ pura-png resize input.png --fit 800x600 --out fitted.png
 
 ## Benchmark
 
+These historical measurements include ffmpeg process startup. They do not compare against an in-process C codec or establish Rails pipeline throughput.
+
 400×400 image, Ruby 4.0.2 + YJIT.
 
 ### Decode
@@ -79,8 +81,7 @@ pura-png is slower than chunky_png for decoding, but supports more color types a
 ## Why pure Ruby?
 
 - **`gem install` and go** — no `brew install`, no `apt install`, no C compiler needed
-- **Works everywhere Ruby works** — CRuby, ruby.wasm, JRuby, TruffleRuby
-- **Full PNG support** — all color types and bit depths, not just 8-bit RGB/RGBA
+- Non-interlaced PNG color types and valid bit depths; decoded pixels are 8-bit RGB
 - **Part of pura-\*** — convert between JPEG, PNG, BMP, GIF, TIFF, WebP seamlessly
 
 ## Related gems
@@ -95,6 +96,21 @@ pura-png is slower than chunky_png for decoding, but supports more color types a
 | [pura-ico](https://github.com/komagata/pura-ico) | ICO | ✅ Available |
 | [pura-webp](https://github.com/komagata/pura-webp) | WebP | ✅ Available |
 | [pura-image](https://github.com/komagata/pura-image) | All formats | ✅ Available |
+
+## Pixel model and limitations
+
+Images contain 8-bit RGB pixels. Alpha and tRNS transparency are discarded, not composited. Adam7 interlacing is unsupported. Sixteen-bit samples are reduced to eight bits.
+
+`crop(x, y, width, height)` requires integer coordinates, positive dimensions, and a region entirely inside the image; invalid regions raise `ArgumentError`.
+
+## Decode limits
+
+`Pura::Png.decode(input, max_input_bytes: 64 * 1024 * 1024,
+max_pixels: 40_000_000, max_decoded_bytes: 256 * 1024 * 1024)` accepts a path or binary data.
+All limits must be positive integers. These defaults bound input, pixel count, and decoded data size; they are not a cap on the Ruby process's total memory or CPU time.
+
+Invalid image data raises `Pura::Png::DecodeError`; exceeding a configured limit raises its subclass `Pura::Png::LimitExceeded`.
+PNG decoding validates chunk CRCs and the IHDR layout, rejects invalid color/depth combinations, and checks scanline length during bounded decompression.
 
 ## License
 

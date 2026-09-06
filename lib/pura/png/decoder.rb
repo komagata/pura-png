@@ -4,6 +4,9 @@ require "zlib"
 
 module Pura
   module Png
+    class DecodeError < StandardError; end
+    class LimitExceeded < DecodeError; end
+
     class Decoder
       PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10].pack("C8")
 
@@ -14,16 +17,34 @@ module Pura
       GRAYSCALE_ALPHA = 4
       RGBA            = 6
 
-      def self.decode(input)
+      DEFAULT_MAX_INPUT_BYTES = 64 * 1024 * 1024
+      DEFAULT_MAX_PIXELS = 40_000_000
+      DEFAULT_MAX_DECODED_BYTES = 256 * 1024 * 1024
+      BIT_DEPTHS = { 0 => [1, 2, 4, 8, 16], 2 => [8, 16], 3 => [1, 2, 4, 8],
+                     4 => [8, 16], 6 => [8, 16] }.freeze
+
+      def self.decode(input, max_input_bytes: DEFAULT_MAX_INPUT_BYTES, **options)
+        unless max_input_bytes.is_a?(Integer) && max_input_bytes.positive?
+          raise ArgumentError, "max_input_bytes must be a positive integer"
+        end
+
         data = if input.is_a?(String) && !input.include?("\x00") && input.bytesize < 4096 && File.exist?(input)
-                 File.binread(input)
+                 File.binread(input, max_input_bytes + 1)
                else
                  input.b
                end
-        new(data).decode
+        raise LimitExceeded, "PNG input limit exceeded" if data.bytesize > max_input_bytes
+
+        new(data, **options).decode
       end
 
-      def initialize(data)
+      def initialize(data, max_pixels: DEFAULT_MAX_PIXELS, max_decoded_bytes: DEFAULT_MAX_DECODED_BYTES)
+        unless [max_pixels, max_decoded_bytes].all? { |value| value.is_a?(Integer) && value.positive? }
+          raise ArgumentError, "decode limits must be positive integers"
+        end
+
+        @max_pixels = max_pixels
+        @max_decoded_bytes = max_decoded_bytes
         @data = data
         @pos = 0
       end
@@ -39,10 +60,14 @@ module Pura
         loop do
           length, type = read_chunk_header
           chunk_data = read_bytes(length)
-          _crc = read_uint32
+          crc = read_uint32
+          raise DecodeError, "Invalid PNG CRC for #{type}" unless crc == Zlib.crc32(type + chunk_data)
+          raise DecodeError, "IHDR must be the first chunk" if !ihdr && type != "IHDR"
 
           case type
           when "IHDR"
+            raise DecodeError, "Duplicate IHDR chunk" if ihdr
+
             ihdr = parse_ihdr(chunk_data)
           when "PLTE"
             palette = parse_plte(chunk_data)
@@ -51,15 +76,19 @@ module Pura
           when "IDAT"
             idat_chunks << chunk_data
           when "IEND"
+            raise DecodeError, "IEND must be empty" unless chunk_data.empty?
+
             break
+          else
+            raise DecodeError, "Unknown critical PNG chunk: #{type}" if type.getbyte(0).allbits?(0x20) == false
           end
         end
 
-        raise "Missing IHDR chunk" unless ihdr
-        raise "Missing IDAT chunk" if idat_chunks.empty?
+        raise DecodeError, "Missing IHDR chunk" unless ihdr
+        raise DecodeError, "Missing IDAT chunk" if idat_chunks.empty?
 
         compressed = idat_chunks.join
-        raw = Zlib::Inflate.inflate(compressed)
+        raw = inflate_scanlines(compressed, ihdr)
 
         pixels = reconstruct(raw, ihdr, palette, transparency)
         Image.new(ihdr[:width], ihdr[:height], pixels)
@@ -69,7 +98,7 @@ module Pura
 
       def read_signature
         sig = read_bytes(8)
-        raise "Not a PNG file" unless sig == PNG_SIGNATURE
+        raise DecodeError, "Not a PNG file" unless sig == PNG_SIGNATURE
       end
 
       def read_chunk_header
@@ -79,7 +108,7 @@ module Pura
       end
 
       def read_bytes(n)
-        raise "Unexpected end of data" if @pos + n > @data.bytesize
+        raise DecodeError, "Unexpected end of data" if @pos + n > @data.bytesize
 
         result = @data.byteslice(@pos, n)
         @pos += n
@@ -92,10 +121,18 @@ module Pura
       end
 
       def parse_ihdr(data)
+        raise DecodeError, "IHDR must contain 13 bytes" unless data.bytesize == 13
+
         width, height, bit_depth, color_type, compression, filter, interlace = data.unpack("NNC5")
-        raise "Unsupported compression method: #{compression}" unless compression.zero?
-        raise "Unsupported filter method: #{filter}" unless filter.zero?
-        raise "Interlaced PNGs (Adam7) are not supported" unless interlace.zero?
+        raise DecodeError, "Invalid PNG dimensions" unless width.positive? && height.positive?
+        raise LimitExceeded, "PNG pixel limit exceeded" if width * height > @max_pixels
+        unless BIT_DEPTHS.fetch(color_type, []).include?(bit_depth)
+          raise DecodeError, "Invalid PNG color type / bit depth: #{color_type} / #{bit_depth}"
+        end
+
+        raise DecodeError, "Unsupported compression method: #{compression}" unless compression.zero?
+        raise DecodeError, "Unsupported filter method: #{filter}" unless filter.zero?
+        raise DecodeError, "Interlaced PNGs (Adam7) are not supported" unless interlace.zero?
 
         {
           width: width,
@@ -106,8 +143,32 @@ module Pura
         }
       end
 
+      def inflate_scanlines(compressed, ihdr)
+        row_bytes = ((ihdr[:width] * samples_per_pixel(ihdr) * ihdr[:bit_depth]) + 7) / 8
+        expected = (row_bytes + 1) * ihdr[:height]
+        if [expected, ihdr[:width] * ihdr[:height] * 3].max > @max_decoded_bytes
+          raise LimitExceeded, "PNG decoded byte limit exceeded"
+        end
+
+        raw = String.new(encoding: Encoding::BINARY)
+        inflater = Zlib::Inflate.new
+        inflater.inflate(compressed) do |chunk|
+          raise DecodeError, "Excess PNG scanline data" if raw.bytesize + chunk.bytesize > expected
+
+          raw << chunk
+        end
+        raise DecodeError, "Incomplete PNG compressed data" unless inflater.finished?
+        raise DecodeError, "Incorrect PNG scanline data length" unless raw.bytesize == expected
+
+        raw
+      rescue Zlib::Error => e
+        raise DecodeError, "Invalid PNG compressed data: #{e.message}"
+      ensure
+        inflater&.close
+      end
+
       def parse_plte(data)
-        raise "PLTE chunk length not divisible by 3" unless (data.bytesize % 3).zero?
+        raise DecodeError, "PLTE chunk length not divisible by 3" unless (data.bytesize % 3).zero?
 
         entries = data.bytesize / 3
         palette = Array.new(entries)
@@ -125,7 +186,7 @@ module Pura
         when INDEXED         then 1
         when GRAYSCALE_ALPHA then 2
         when RGBA            then 4
-        else raise "Unknown color type: #{ihdr[:color_type]}"
+        else raise DecodeError, "Unknown color type: #{ihdr[:color_type]}"
         end
       end
 
@@ -136,7 +197,7 @@ module Pura
         when INDEXED         then 1
         when GRAYSCALE_ALPHA then 2
         when RGBA            then 4
-        else raise "Unknown color type: #{ihdr[:color_type]}"
+        else raise DecodeError, "Unknown color type: #{ihdr[:color_type]}"
         end
       end
 
@@ -225,7 +286,7 @@ module Pura
           end
           row
         else
-          raise "Unknown filter type: #{filter_type}"
+          raise DecodeError, "Unknown filter type: #{filter_type}"
         end
       end
 
@@ -319,7 +380,7 @@ module Pura
           end
 
         when INDEXED
-          raise "Missing PLTE for indexed color" unless palette
+          raise DecodeError, "Missing PLTE for indexed color" unless palette
 
           if bit_depth == 8
             width.times do |x|
